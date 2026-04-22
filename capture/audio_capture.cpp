@@ -187,6 +187,20 @@ bool SaveAudioToFile(const std::vector<BYTE>& audioData, const std::string& file
     return true;
 }
 
+WAVEFORMATEX* CreateFallbackWaveFormat() {
+    auto* fmt = reinterpret_cast<WAVEFORMATEX*>(CoTaskMemAlloc(sizeof(WAVEFORMATEX)));
+    if (!fmt) return nullptr;
+    memset(fmt, 0, sizeof(WAVEFORMATEX));
+    fmt->wFormatTag = WAVE_FORMAT_PCM;
+    fmt->nChannels = 2;
+    fmt->nSamplesPerSec = 48000;
+    fmt->wBitsPerSample = 16;
+    fmt->nBlockAlign = static_cast<WORD>(fmt->nChannels * (fmt->wBitsPerSample / 8));
+    fmt->nAvgBytesPerSec = fmt->nSamplesPerSec * fmt->nBlockAlign;
+    fmt->cbSize = 0;
+    return fmt;
+}
+
 // 关键修复：使用 Process Loopback，只捕获目标进程（及其子进程）音频
 bool InitializeAudioCapture(AudioCaptureContext& context, const std::string& outputFileName, DWORD targetProcessId) {
     HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
@@ -222,7 +236,6 @@ bool InitializeAudioCapture(AudioCaptureContext& context, const std::string& out
         CoUninitialize();
         return false;
     }
-    memcpy(activateVariant.blob.pBlobData, &activationParams, sizeof(activationParams));
 
     ActivateAudioInterfaceAsyncFn activateAudioInterfaceAsync = ResolveActivateAudioInterfaceAsync();
     if (!activateAudioInterfaceAsync) {
@@ -258,11 +271,16 @@ bool InitializeAudioCapture(AudioCaptureContext& context, const std::string& out
     }
 
     hr = context.pAudioClient->GetMixFormat(&context.pWaveFormat);
-    if (FAILED(hr)) {
-        std::cerr << "Failed to get mix format! HRESULT: 0x" << std::hex << hr << std::endl;
-        context.pAudioClient->Release();
-        CoUninitialize();
-        return false;
+    if (FAILED(hr) || !context.pWaveFormat) {
+        std::cerr << "GetMixFormat not available (HRESULT: 0x" << std::hex << hr
+                  << "), using fallback 48kHz/16-bit/stereo PCM." << std::endl;
+        context.pWaveFormat = CreateFallbackWaveFormat();
+        if (!context.pWaveFormat) {
+            std::cerr << "Failed to create fallback wave format." << std::endl;
+            context.pAudioClient->Release();
+            CoUninitialize();
+            return false;
+        }
     }
 
     std::cout << "Audio format: " << std::dec << context.pWaveFormat->nChannels << " channels, "
@@ -271,7 +289,7 @@ bool InitializeAudioCapture(AudioCaptureContext& context, const std::string& out
 
     hr = context.pAudioClient->Initialize(
         AUDCLNT_SHAREMODE_SHARED,
-        0,
+        AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
         10000000,  // 缓冲区时长：1秒（单位100纳秒）
         0,
         context.pWaveFormat,
