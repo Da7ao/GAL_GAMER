@@ -1,9 +1,11 @@
 #include <windows.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
+#include <audioclientactivationparams.h>
 #include <avrt.h>
 #include <audiopolicy.h>
 #include <functiondiscoverykeys_devpkey.h>
+#include <propvarutil.h>
 #include <iostream>
 #include <vector>
 #include <string>
@@ -119,25 +121,6 @@ private:
     IAudioClient* audioClient_;
 };
 
-using ActivateAudioInterfaceAsyncFn = HRESULT (WINAPI*)(
-    LPCWSTR deviceInterfacePath,
-    REFIID riid,
-    PROPVARIANT* activationParams,
-    IActivateAudioInterfaceCompletionHandler* completionHandler,
-    IActivateAudioInterfaceAsyncOperation** activationOperation);
-
-ActivateAudioInterfaceAsyncFn ResolveActivateAudioInterfaceAsync() {
-    static ActivateAudioInterfaceAsyncFn cachedFn = nullptr;
-    if (cachedFn) return cachedFn;
-
-    HMODULE mmdevapiModule = LoadLibraryW(L"Mmdevapi.dll");
-    if (!mmdevapiModule) return nullptr;
-
-    FARPROC proc = GetProcAddress(mmdevapiModule, "ActivateAudioInterfaceAsync");
-    cachedFn = reinterpret_cast<ActivateAudioInterfaceAsyncFn>(proc);
-    return cachedFn;
-}
-
 bool SaveAudioToFile(const std::vector<BYTE>& audioData, const std::string& fileName, const WAVEFORMATEX* pWaveFormat) {
     struct WAVHeader {
         char riff[4];
@@ -206,11 +189,9 @@ bool InitializeAudioCapture(AudioCaptureContext& context, const std::string& out
 
     PROPVARIANT activateVariant;
     PropVariantInit(&activateVariant);
-    activateVariant.vt = VT_BLOB;
-    activateVariant.blob.cbSize = sizeof(activationParams);
-    activateVariant.blob.pBlobData = reinterpret_cast<BYTE*>(CoTaskMemAlloc(sizeof(activationParams)));
-    if (!activateVariant.blob.pBlobData) {
-        std::cerr << "Failed to allocate activation params blob!" << std::endl;
+    hr = InitPropVariantFromBuffer(&activationParams, sizeof(activationParams), &activateVariant);
+    if (FAILED(hr)) {
+        std::cerr << "Failed to create activation params! HRESULT: 0x" << std::hex << hr << std::endl;
         CoUninitialize();
         return false;
     }
@@ -223,17 +204,8 @@ bool InitializeAudioCapture(AudioCaptureContext& context, const std::string& out
         return false;
     }
 
-    ActivateAudioInterfaceAsyncFn activateAudioInterfaceAsync = ResolveActivateAudioInterfaceAsync();
-    if (!activateAudioInterfaceAsync) {
-        std::cerr << "ActivateAudioInterfaceAsync not found in Mmdevapi.dll." << std::endl;
-        completionHandler->Release();
-        PropVariantClear(&activateVariant);
-        CoUninitialize();
-        return false;
-    }
-
     IActivateAudioInterfaceAsyncOperation* asyncOperation = nullptr;
-    hr = activateAudioInterfaceAsync(
+    hr = ActivateAudioInterfaceAsync(
         VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
         __uuidof(IAudioClient),
         &activateVariant,
