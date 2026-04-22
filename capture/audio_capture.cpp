@@ -1,7 +1,6 @@
 #include <windows.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
-#include <audioclientactivationparams.h>
 #include <avrt.h>
 #include <audiopolicy.h>
 #include <functiondiscoverykeys_devpkey.h>
@@ -60,7 +59,7 @@ public:
     AudioActivationCompletionHandler() : refCount_(1), completedEvent_(CreateEvent(nullptr, FALSE, FALSE, nullptr)),
                                          activateResult_(E_FAIL), audioClient_(nullptr) {}
 
-    ~AudioActivationCompletionHandler() override {
+    ~AudioActivationCompletionHandler() {
         if (completedEvent_) CloseHandle(completedEvent_);
         if (audioClient_) audioClient_->Release();
     }
