@@ -1,9 +1,11 @@
 #include <windows.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
+#include <audioclientactivationparams.h>
 #include <avrt.h>
 #include <audiopolicy.h>
 #include <functiondiscoverykeys_devpkey.h>
+#include <propvarutil.h>
 #include <iostream>
 #include <vector>
 #include <string>
