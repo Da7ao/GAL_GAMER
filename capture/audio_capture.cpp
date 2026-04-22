@@ -19,16 +19,10 @@
 #include <cstring>
 #include <comdef.h>  // 添加 _bstr_t 支持
 
-#if __has_include(<audioclientactivationparams.h>)
-#include <audioclientactivationparams.h>
-#define HAS_AUDIOCLIENTACTIVATIONPARAMS_HEADER 1
-#endif
-
 #ifndef VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK
 #define VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK L"VAD\\Process_Loopback"
 #endif
 
-#ifndef HAS_AUDIOCLIENTACTIVATIONPARAMS_HEADER
 typedef enum AUDIOCLIENT_ACTIVATION_TYPE {
     AUDIOCLIENT_ACTIVATION_TYPE_DEFAULT = 0,
     AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK = 1
@@ -50,7 +44,6 @@ typedef struct AUDIOCLIENT_ACTIVATION_PARAMS {
         AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS ProcessLoopbackParams;
     };
 } AUDIOCLIENT_ACTIVATION_PARAMS;
-#endif
 
 struct AudioCaptureContext {
     IAudioClient* pAudioClient;
@@ -121,6 +114,25 @@ private:
     IAudioClient* audioClient_;
 };
 
+using ActivateAudioInterfaceAsyncFn = HRESULT (WINAPI*)(
+    LPCWSTR deviceInterfacePath,
+    REFIID riid,
+    PROPVARIANT* activationParams,
+    IActivateAudioInterfaceCompletionHandler* completionHandler,
+    IActivateAudioInterfaceAsyncOperation** activationOperation);
+
+ActivateAudioInterfaceAsyncFn ResolveActivateAudioInterfaceAsync() {
+    static ActivateAudioInterfaceAsyncFn cachedFn = nullptr;
+    if (cachedFn) return cachedFn;
+
+    HMODULE mmdevapiModule = LoadLibraryW(L"Mmdevapi.dll");
+    if (!mmdevapiModule) return nullptr;
+
+    FARPROC proc = GetProcAddress(mmdevapiModule, "ActivateAudioInterfaceAsync");
+    cachedFn = reinterpret_cast<ActivateAudioInterfaceAsyncFn>(proc);
+    return cachedFn;
+}
+
 bool SaveAudioToFile(const std::vector<BYTE>& audioData, const std::string& fileName, const WAVEFORMATEX* pWaveFormat) {
     struct WAVHeader {
         char riff[4];
@@ -189,9 +201,11 @@ bool InitializeAudioCapture(AudioCaptureContext& context, const std::string& out
 
     PROPVARIANT activateVariant;
     PropVariantInit(&activateVariant);
-    hr = InitPropVariantFromBuffer(&activationParams, sizeof(activationParams), &activateVariant);
-    if (FAILED(hr)) {
-        std::cerr << "Failed to create activation params! HRESULT: 0x" << std::hex << hr << std::endl;
+    activateVariant.vt = VT_BLOB;
+    activateVariant.blob.cbSize = sizeof(activationParams);
+    activateVariant.blob.pBlobData = reinterpret_cast<BYTE*>(CoTaskMemAlloc(sizeof(activationParams)));
+    if (!activateVariant.blob.pBlobData) {
+        std::cerr << "Failed to allocate activation params blob!" << std::endl;
         CoUninitialize();
         return false;
     }
@@ -203,9 +217,19 @@ bool InitializeAudioCapture(AudioCaptureContext& context, const std::string& out
         CoUninitialize();
         return false;
     }
+    memcpy(activateVariant.blob.pBlobData, &activationParams, sizeof(activationParams));
+
+    ActivateAudioInterfaceAsyncFn activateAudioInterfaceAsync = ResolveActivateAudioInterfaceAsync();
+    if (!activateAudioInterfaceAsync) {
+        std::cerr << "ActivateAudioInterfaceAsync not found in Mmdevapi.dll." << std::endl;
+        completionHandler->Release();
+        PropVariantClear(&activateVariant);
+        CoUninitialize();
+        return false;
+    }
 
     IActivateAudioInterfaceAsyncOperation* asyncOperation = nullptr;
-    hr = ActivateAudioInterfaceAsync(
+    hr = activateAudioInterfaceAsync(
         VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
         __uuidof(IAudioClient),
         &activateVariant,
@@ -408,8 +432,7 @@ HWND FindMainWindow(DWORD processId) {
 }
 
 void ContinuousAudioCapture(const std::string& baseFileName, DWORD processId, int durationMs = 10000) {
-    AudioCaptureContext context;
-    memset(&context, 0, sizeof(context));  // 确保指针初始化为 NULL
+    AudioCaptureContext context{};  // value-init，避免对 std::atomic/std::vector 使用 memset
 
     if (!InitializeAudioCapture(context, baseFileName, processId)) {
         std::cerr << "Failed to initialize audio capture!" << std::endl;
