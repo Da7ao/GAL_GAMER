@@ -55,7 +55,7 @@ struct AudioCaptureContext {
     DWORD targetProcessId;
 };
 
-class AudioActivationCompletionHandler : public IActivateAudioInterfaceCompletionHandler {
+class AudioActivationCompletionHandler : public IActivateAudioInterfaceCompletionHandler, public IAgileObject {
 public:
     AudioActivationCompletionHandler() : refCount_(1), completedEvent_(CreateEvent(nullptr, FALSE, FALSE, nullptr)),
                                          activateResult_(E_FAIL), audioClient_(nullptr) {}
@@ -80,6 +80,11 @@ public:
         if (!object) return E_POINTER;
         if (iid == __uuidof(IUnknown) || iid == __uuidof(IActivateAudioInterfaceCompletionHandler)) {
             *object = static_cast<IActivateAudioInterfaceCompletionHandler*>(this);
+            AddRef();
+            return S_OK;
+        }
+        if (iid == __uuidof(IAgileObject)) {
+            *object = static_cast<IAgileObject*>(this);
             AddRef();
             return S_OK;
         }
