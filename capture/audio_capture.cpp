@@ -17,15 +17,106 @@
 #include <cstring>
 #include <comdef.h>  // 添加 _bstr_t 支持
 
+#if __has_include(<audioclientactivationparams.h>)
+#include <audioclientactivationparams.h>
+#define HAS_AUDIOCLIENTACTIVATIONPARAMS_HEADER 1
+#endif
+
+#ifndef VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK
+#define VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK L"VAD\\Process_Loopback"
+#endif
+
+#ifndef HAS_AUDIOCLIENTACTIVATIONPARAMS_HEADER
+typedef enum AUDIOCLIENT_ACTIVATION_TYPE {
+    AUDIOCLIENT_ACTIVATION_TYPE_DEFAULT = 0,
+    AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK = 1
+} AUDIOCLIENT_ACTIVATION_TYPE;
+
+typedef enum PROCESS_LOOPBACK_MODE {
+    PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE = 0,
+    PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE = 1
+} PROCESS_LOOPBACK_MODE;
+
+typedef struct AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
+    DWORD TargetProcessId;
+    PROCESS_LOOPBACK_MODE ProcessLoopbackMode;
+} AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS;
+
+typedef struct AUDIOCLIENT_ACTIVATION_PARAMS {
+    AUDIOCLIENT_ACTIVATION_TYPE ActivationType;
+    union {
+        AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS ProcessLoopbackParams;
+    };
+} AUDIOCLIENT_ACTIVATION_PARAMS;
+#endif
+
 struct AudioCaptureContext {
-    IMMDevice* pDevice;
     IAudioClient* pAudioClient;
-    IAudioCaptureClient* pCaptureClient;  // ✅ 改为 CaptureClient
+    IAudioCaptureClient* pCaptureClient;
     WAVEFORMATEX* pWaveFormat;
     std::atomic<bool> isCapturing;
     std::vector<BYTE> audioBuffer;
     std::string outputFileName;
     DWORD targetProcessId;
+};
+
+class AudioActivationCompletionHandler : public IActivateAudioInterfaceCompletionHandler {
+public:
+    AudioActivationCompletionHandler() : refCount_(1), completedEvent_(CreateEvent(nullptr, FALSE, FALSE, nullptr)),
+                                         activateResult_(E_FAIL), audioClient_(nullptr) {}
+
+    ~AudioActivationCompletionHandler() override {
+        if (completedEvent_) CloseHandle(completedEvent_);
+        if (audioClient_) audioClient_->Release();
+    }
+
+    HRESULT WaitForCompletion(DWORD timeoutMs, IAudioClient** outAudioClient) {
+        if (!completedEvent_) return E_FAIL;
+        DWORD waitResult = WaitForSingleObject(completedEvent_, timeoutMs);
+        if (waitResult != WAIT_OBJECT_0) return HRESULT_FROM_WIN32(waitResult == WAIT_TIMEOUT ? WAIT_TIMEOUT : GetLastError());
+        if (FAILED(activateResult_)) return activateResult_;
+        if (!audioClient_) return E_FAIL;
+        *outAudioClient = audioClient_;
+        (*outAudioClient)->AddRef();
+        return S_OK;
+    }
+
+    STDMETHODIMP QueryInterface(REFIID iid, void** object) override {
+        if (!object) return E_POINTER;
+        if (iid == __uuidof(IUnknown) || iid == __uuidof(IActivateAudioInterfaceCompletionHandler)) {
+            *object = static_cast<IActivateAudioInterfaceCompletionHandler*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *object = nullptr;
+        return E_NOINTERFACE;
+    }
+
+    STDMETHODIMP_(ULONG) AddRef() override { return InterlockedIncrement(&refCount_); }
+
+    STDMETHODIMP_(ULONG) Release() override {
+        ULONG ref = InterlockedDecrement(&refCount_);
+        if (ref == 0) delete this;
+        return ref;
+    }
+
+    STDMETHODIMP ActivateCompleted(IActivateAudioInterfaceAsyncOperation* operation) override {
+        if (!operation) return E_POINTER;
+        IUnknown* activatedInterface = nullptr;
+        HRESULT hr = operation->GetActivateResult(&activateResult_, &activatedInterface);
+        if (SUCCEEDED(hr) && SUCCEEDED(activateResult_) && activatedInterface) {
+            activatedInterface->QueryInterface(IID_PPV_ARGS(&audioClient_));
+        }
+        if (activatedInterface) activatedInterface->Release();
+        SetEvent(completedEvent_);
+        return S_OK;
+    }
+
+private:
+    LONG refCount_;
+    HANDLE completedEvent_;
+    HRESULT activateResult_;
+    IAudioClient* audioClient_;
 };
 
 bool SaveAudioToFile(const std::vector<BYTE>& audioData, const std::string& fileName, const WAVEFORMATEX* pWaveFormat) {
@@ -77,35 +168,62 @@ bool SaveAudioToFile(const std::vector<BYTE>& audioData, const std::string& file
     return true;
 }
 
-// ✅ 关键修复：使用 LOOPBACK 模式初始化，捕获系统播放的音频
+// 关键修复：使用 Process Loopback，只捕获目标进程（及其子进程）音频
 bool InitializeAudioCapture(AudioCaptureContext& context, const std::string& outputFileName, DWORD targetProcessId) {
-    HRESULT hr = CoInitialize(NULL);
+    HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (hr == RPC_E_CHANGED_MODE) {
+        std::cerr << "COM is already initialized with a different threading model." << std::endl;
+        return false;
+    }
     if (FAILED(hr)) {
         std::cerr << "Failed to initialize COM! HRESULT: 0x" << std::hex << hr << std::endl;
         return false;
     }
 
-    IMMDeviceEnumerator* pEnumerator = NULL;
-    hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL,
-                          __uuidof(IMMDeviceEnumerator), (void**)&pEnumerator);
-    if (FAILED(hr)) {
-        std::cerr << "Failed to create device enumerator! HRESULT: 0x" << std::hex << hr << std::endl;
+    AUDIOCLIENT_ACTIVATION_PARAMS activationParams = {};
+    activationParams.ActivationType = AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK;
+    activationParams.ProcessLoopbackParams.TargetProcessId = targetProcessId;
+    activationParams.ProcessLoopbackParams.ProcessLoopbackMode = PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE;
+
+    PROPVARIANT activateVariant;
+    PropVariantInit(&activateVariant);
+    activateVariant.vt = VT_BLOB;
+    activateVariant.blob.cbSize = sizeof(activationParams);
+    activateVariant.blob.pBlobData = reinterpret_cast<BYTE*>(CoTaskMemAlloc(sizeof(activationParams)));
+    if (!activateVariant.blob.pBlobData) {
+        std::cerr << "Failed to allocate activation params blob!" << std::endl;
+        CoUninitialize();
+        return false;
+    }
+    memcpy(activateVariant.blob.pBlobData, &activationParams, sizeof(activationParams));
+
+    auto* completionHandler = new AudioActivationCompletionHandler();
+    if (!completionHandler) {
+        PropVariantClear(&activateVariant);
         CoUninitialize();
         return false;
     }
 
-    hr = pEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &context.pDevice);
-    pEnumerator->Release();
+    IActivateAudioInterfaceAsyncOperation* asyncOperation = nullptr;
+    hr = ActivateAudioInterfaceAsync(
+        VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
+        __uuidof(IAudioClient),
+        &activateVariant,
+        completionHandler,
+        &asyncOperation);
+    PropVariantClear(&activateVariant);
     if (FAILED(hr)) {
-        std::cerr << "Failed to get default audio render device! HRESULT: 0x" << std::hex << hr << std::endl;
+        std::cerr << "ActivateAudioInterfaceAsync failed! HRESULT: 0x" << std::hex << hr << std::endl;
+        completionHandler->Release();
         CoUninitialize();
         return false;
     }
 
-    hr = context.pDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, NULL, (void**)&context.pAudioClient);
+    hr = completionHandler->WaitForCompletion(5000, &context.pAudioClient);
+    if (asyncOperation) asyncOperation->Release();
+    completionHandler->Release();
     if (FAILED(hr)) {
-        std::cerr << "Failed to activate audio client! HRESULT: 0x" << std::hex << hr << std::endl;
-        context.pDevice->Release();
+        std::cerr << "Process-loopback activation failed! HRESULT: 0x" << std::hex << hr << std::endl;
         CoUninitialize();
         return false;
     }
@@ -114,7 +232,6 @@ bool InitializeAudioCapture(AudioCaptureContext& context, const std::string& out
     if (FAILED(hr)) {
         std::cerr << "Failed to get mix format! HRESULT: 0x" << std::hex << hr << std::endl;
         context.pAudioClient->Release();
-        context.pDevice->Release();
         CoUninitialize();
         return false;
     }
@@ -123,10 +240,9 @@ bool InitializeAudioCapture(AudioCaptureContext& context, const std::string& out
               << context.pWaveFormat->nSamplesPerSec << " Hz, "
               << context.pWaveFormat->wBitsPerSample << " bits" << std::endl;
 
-    // ✅ 关键：AUDCLNT_STREAMFLAGS_LOOPBACK 让我们能捕获扬声器播放的音频
     hr = context.pAudioClient->Initialize(
         AUDCLNT_SHAREMODE_SHARED,
-        AUDCLNT_STREAMFLAGS_LOOPBACK,   // ✅ Loopback 录音标志
+        0,
         10000000,  // 缓冲区时长：1秒（单位100纳秒）
         0,
         context.pWaveFormat,
@@ -135,18 +251,15 @@ bool InitializeAudioCapture(AudioCaptureContext& context, const std::string& out
         std::cerr << "Failed to initialize audio client with loopback! HRESULT: 0x" << std::hex << hr << std::endl;
         CoTaskMemFree(context.pWaveFormat);
         context.pAudioClient->Release();
-        context.pDevice->Release();
         CoUninitialize();
         return false;
     }
 
-    // ✅ 获取 CaptureClient 而非 RenderClient
     hr = context.pAudioClient->GetService(__uuidof(IAudioCaptureClient), (void**)&context.pCaptureClient);
     if (FAILED(hr)) {
         std::cerr << "Failed to get capture client! HRESULT: 0x" << std::hex << hr << std::endl;
         CoTaskMemFree(context.pWaveFormat);
         context.pAudioClient->Release();
-        context.pDevice->Release();
         CoUninitialize();
         return false;
     }
@@ -156,7 +269,7 @@ bool InitializeAudioCapture(AudioCaptureContext& context, const std::string& out
     context.isCapturing = false;
     context.audioBuffer.clear();
 
-    std::cout << "Audio capture initialized successfully (Loopback mode)!" << std::endl;
+    std::cout << "Audio capture initialized successfully (Process Loopback mode)!" << std::endl;
     return true;
 }
 
@@ -336,7 +449,6 @@ void ContinuousAudioCapture(const std::string& baseFileName, DWORD processId, in
     // 清理资源
     if (context.pCaptureClient) context.pCaptureClient->Release();
     if (context.pAudioClient)   context.pAudioClient->Release();
-    if (context.pDevice)        context.pDevice->Release();
     if (context.pWaveFormat)    CoTaskMemFree(context.pWaveFormat);
     CoUninitialize();
 }
